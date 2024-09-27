@@ -1,5 +1,7 @@
 # TADAM(Trust region ADAptive Moment estimation)
 
+[Tadam Paper](https://www.sciencedirect.com/science/article/pii/S089360802300504X)
+
 [Tensorflow Implementation of Tadam](https://github.com/dddong2/Tadam/tree/main)
 
 This is the PyTorch implementation of Tadam. 
