@@ -1,5 +1,16 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 from torch.optim.optimizer import Optimizer
+
+import random
+import numpy as np
+import matplotlib.pyplot as plt
+
+# import os
+# os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
 
 class Tadam(Optimizer):
     """
@@ -48,71 +59,82 @@ class Tadam(Optimizer):
 
         # Loop through each parameter group in the optimizer
         for group in self.param_groups:
+            grad_lst = []
             for p in group['params']:
                 if p.grad is None:
                     continue
-                grad = p.grad.data  # Access the gradient data
+                grad = p.grad.detach()  # Access the gradient data
+                grad_lst.append(grad.view(-1))
+            grad_flat = torch.cat(grad_lst)
+            
+            # Initialize state variables if this is the first update
+            state = self.state[p]
+            if len(state) == 0:
+                state['step'] = 0
+                state['m'] = torch.zeros_like(grad_flat)
+                state['m_hat'] = torch.zeros_like(grad_flat)
+                state['v'] = torch.full_like(grad_flat, group['eps'])
+                state['s'] = torch.zeros_like(grad_flat)
+                state['dt'] = 1.0
+                state['ls_h'] = 0.0
+                state['loss_avg'] = 0.0
+                state['pr'] = 0.0
 
-                # Initialize state variables if this is the first update
-                state = self.state[p]
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['m'] = torch.zeros_like(p.data)
-                    state['m_hat'] = torch.zeros_like(p.data)
-                    state['v'] = torch.full_like(p.data, group['eps'])
-                    state['s'] = torch.zeros_like(p.data)
-                    state['bp1'] = group['betas'][0]
-                    state['bp2'] = group['betas'][1]
-                    state['dt'] = 1.0
-                    state['ls_h'] = 0.0
-                    state['loss_avg'] = 0.0
-                    state['pr'] = 0.0
+            # Increment step count
+            state['step'] += 1
 
-                # Increment step count
-                state['step'] += 1
+            # Extract parameters
+            beta1, beta2, gamma, eps = group['betas'][0], group['betas'][1], group['gamma'], group['eps']
+            m, m_hat, v, s = state['m'], state['m_hat'], state['v'], state['s']
+            
+            bias1 = (1 - beta1**state['step'])
+            bias2 = (1 - beta2**state['step'])
 
-                # Extract parameters
-                beta1, beta2, gamma, eps = group['betas'][0], group['betas'][1], group['gamma'], group['eps']
-                m, v, s = state['m'], state['v'], state['s']
+            # Update moving averages
+            v.mul_(beta2).addcmul_(grad_flat - m_hat, (grad_flat - m_hat)*(beta2 - beta2**state['step'])/bias2, value=(1 - beta2))
+            v_hat = v / bias2
 
-                # Update moving averages
-                m.mul_(beta1).add_(grad, alpha=(1 - beta1))
-                m_hat = m / (1 - beta1**state['step'])
-                
-                s.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
-                s_hat = s / (1 - beta2**state['step'])
+            m.mul_(beta1).add_(grad_flat, alpha=(1 - beta1))
+            m_hat = m / bias1
+            
+            s.mul_(beta2).addcmul_(grad_flat, grad_flat, value=(1 - beta2))
+            s_hat = s / bias2
 
-                # Trust region adjustment using Fisher information approximation
-                v.mul_(beta2).addcmul_(grad - m_hat, grad - m_hat, value=(1 - beta2))
-                v_hat = v / (1 - beta2**state['step'])
-                
-                fisher_information = (1.0 + (m_hat ** 2).sum() / (v_hat + eps).sum()) * v_hat
-                trust_region_scale = torch.max(state['dt'] * fisher_information, torch.sqrt(s_hat))
-                adjusted_gradient = m_hat * state['dt'] / (trust_region_scale + eps)
+            # Trust region adjustment using Fisher information approximation
+            v.mul_(beta2).addcmul_(grad_flat - m_hat, grad_flat - m_hat, value=(1 - beta2))
+            v_hat = v / bias2
+            
+            fisher_information = (1.0 + (m_hat.square() / (v_hat + eps)).sum()) * v_hat
+            trust_region_scale = torch.max(state['dt'] * fisher_information, s_hat.sqrt())
+            adjusted_gradient = m_hat * state['dt'] / (trust_region_scale + eps)
 
-                # Apply weight decay if applicable
-                if group['weight_decay'] != 0:
-                    p.data.add_(p.data, alpha=-group['weight_decay'])
-                
-                # Update parameters using adjusted gradient
-                p.data.add_(adjusted_gradient, alpha=-group['lr'])
+            gradients_idx = 0
+            # restore gradient shape and update
+            for p in group['params']:
+                if p.grad is not None:
+                    param_size = p.grad.numel()
+                    restored_grad = adjusted_gradient[gradients_idx:gradients_idx + param_size].view_as(p.grad)
+                    gradients_idx += param_size
 
-                # Optionally update the trust region using the loss function
-                if loss is not None:
-                    state['loss_avg'] = beta1 * state['loss_avg'] + (1 - beta1) * loss.item()
-                    state['ls_h'] = state['loss_avg'] / (1 - beta1**state['step'])
+                    # Apply weight decay if applicable
+                    if group['weight_decay'] != 0:
+                        p.data.add_(p.data, alpha=-group['weight_decay'])
+            
+                    # Update parameters using adjusted gradient
+                    p.data.add_(restored_grad, alpha=-group['lr'])
 
-                    # Adjust trust region based on predicted reduction
-                    rho = (state['ls_h'] - loss.item()) / max(state['pr'], eps)
-                    dt_min = (1.0 - gamma) ** ((state['step'] - 1) / group['total_steps'])
-                    dt_max = 1.0 + gamma ** ((state['step'] - 1) / group['total_steps'])
-                    state['dt'] = min(max(rho * state['dt'], dt_min), dt_max)
-                    state['pr'] = ((m_hat * adjusted_gradient).sum() - 0.5 * (v_hat * adjusted_gradient ** 2).sum()).item() * group['lr']
-
-            # Update the moment decay rates
-            state['bp1'] *= beta1
-            state['bp2'] *= beta2
-
+            # Optionally update the trust region using the loss function
+            if loss is not None:
+                # Adjust trust region based on predicted reduction
+                rho = torch.tensor((state['ls_h'] - loss.item()) / max(state['pr'], eps), dtype=torch.float)
+                dt_min = torch.tensor((1.0 - gamma) ** ((state['step']) / group['total_steps']), dtype=torch.float)
+                dt_max = torch.tensor(1.0 + gamma ** ((state['step']) / group['total_steps']), dtype=torch.float)
+                r = torch.where(rho < gamma, dt_min, torch.where(rho> 1-gamma, dt_max, torch.tensor(1.0)))
+                state['dt'] = min(max(r * state['dt'], dt_min), dt_max)
+                state['pr'] = (m_hat * adjusted_gradient - 0.5 * v_hat * adjusted_gradient.square()).sum().item() * group['lr']
+                # Update the moving average of the loss function
+                state['loss_avg'] = beta1 * state['loss_avg'] + (1 - beta1) * loss.item()
+                state['ls_h'] = state['loss_avg'] / bias1
         return loss
 
 
